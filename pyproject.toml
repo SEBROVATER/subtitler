@@ -72,4 +72,4 @@ target-version = "py311"
 [tool.black]
 line-length = 100
 target-version = ['py311']
-extend-exclude = ""
+extend-exclude = "(^/google)|(^/yandex)"
