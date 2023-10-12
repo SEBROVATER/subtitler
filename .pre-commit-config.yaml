@@ -10,7 +10,6 @@ repos:
     hooks:
 
       - id: black
-        args: [ "--line-length", "100" ]
         name: black
         stages: [ commit ]
         language: system
