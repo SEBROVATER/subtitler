@@ -1,5 +1,11 @@
 # See https://pre-commit.com/ for usage and config
 repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.0.292
+    hooks:
+      - id: ruff
+        args: [ --fix, --exit-non-zero-on-fix ]
   - repo: local
     hooks:
 
@@ -9,13 +15,6 @@ repos:
         stages: [ commit ]
         language: system
         entry: black
-        types: [ python ]
-
-      - id: pyupgrade
-        name: pyupgrade
-        stages: [ commit ]
-        language: system
-        entry: pyupgrade
         types: [ python ]
 
 #      - id: pytest
