@@ -1,127 +1,138 @@
-import asyncio
 import os
-from operator import itemgetter
 
-import dotenv
+import grpc
 import pyaudio
-from deepgram import Deepgram
+from dotenv import load_dotenv
 
+import yandex.cloud.ai.stt.v3.stt_pb2 as stt_pb2
+import yandex.cloud.ai.stt.v3.stt_service_pb2_grpc as stt_service_pb2_grpc
 from general_utils.loggers import get_logger
 from general_utils.utils import GracefulKiller
+
+LOGGER = get_logger(__name__)
 
 
 class Subtitler:
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
-    RATE = 16000
-    CHUNK = 8000
-    LOGGER = get_logger("subtitler", False)
+    SAMPLE_RATE = 8000
+    CHUNK = 4096
+    RECORD_SECONDS = 30
+    PROFANITY_FILTER = False
+    LITERATURE_TEXT = False
 
     def __init__(self):
-        self.audio_queue = asyncio.Queue()
+        load_dotenv()
+        self.secret = os.environ.get("YANDEX_API_KEY", None)
+        if self.secret is None:
+            raise
+
         self.killer = GracefulKiller()
-        self.current_sentence = list()
-        dotenv.load_dotenv()
-        self.api_key = os.environ["API_KEY"]
 
-    def mic_callback(self, input_data, frame_count, time_info, status_flag):
-        self.audio_queue.put_nowait(input_data)
-        return (input_data, pyaudio.paContinue)
-
-    def transcribe_callback(self, data):
-        best_transcript = self.get_best_transcript(data)
-        if not best_transcript:
-            return
-        print(best_transcript, end="\n" if data["is_final"] else "\r")
-
-    @staticmethod
-    def get_best_transcript(data):
-        return max(data["channel"]["alternatives"], key=itemgetter("confidence"))["transcript"]
-        # return tuple(d["transcript"] for d in data["channel"]["alternatives"])
-
-    async def start(self):
-        dg_client = Deepgram(self.api_key)
-        try:
-            self.deepgramLive = await dg_client.transcription.live(
-                {
-                    "model": "base",
-                    "punctuate": False,
-                    "interim_results": False,
-                    "language": "ru",
-                    "encoding": "linear16",
-                    "sample_rate": self.RATE,
-                    "channels": self.CHANNELS,
-                    "endpointing": 100,
-                }
-            )
-        except Exception:
-            self.LOGGER.exception(f"Could not open socket")
-            return
-
-        try:
-            self.deepgramLive.registerHandler(
-                self.deepgramLive.event.OPEN,
-                lambda msg: self.LOGGER.info(f"WS connection established: {msg}"),
-            )
-            self.deepgramLive.registerHandler(
-                self.deepgramLive.event.ERROR,
-                lambda msg: self.LOGGER.info(f"Error in WS connection: {msg}"),
-            )
-
-            self.deepgramLive.registerHandler(
-                self.deepgramLive.event.CLOSE,
-                lambda code: self.LOGGER.info(f"Connection closed with code {code}"),
-            )
-            self.deepgramLive.registerHandler(
-                self.deepgramLive.event.TRANSCRIPT_RECEIVED, self.transcribe_callback
-            )
-        except Exception:
-            self.LOGGER.exception(f"Could not add handlers to connection socket")
-            await self.deepgramLive.finish()
-            return
-
-        mic_task = asyncio.create_task(self.read_microphone())
-        sender_task = asyncio.create_task(self.sender())
-
-        await mic_task
-        await sender_task
-
-    async def sender(self):
-        try:
-            while self.killer.is_running:
-                mic_data = await self.audio_queue.get()
-                self.deepgramLive.send(mic_data)
-
-            self.LOGGER.info("Stop sending data")
-            await asyncio.sleep(0.5)
-        except Exception as exc:
-            self.LOGGER.error(f"Error while sending data")
-            raise exc
-
-        finally:
-            await self.deepgramLive.finish()
-
-    async def read_microphone(self):
+    def generate_samples(self):
         audio = pyaudio.PyAudio()
-        stream = audio.open(
-            format=self.FORMAT,
-            channels=self.CHANNELS,
-            rate=self.RATE,
-            input=True,
-            frames_per_buffer=self.CHUNK,
-            stream_callback=self.mic_callback,
+        try:
+            recognize_options = stt_pb2.StreamingOptions(
+                recognition_model=stt_pb2.RecognitionModelOptions(
+                    audio_format=stt_pb2.AudioFormatOptions(
+                        raw_audio=stt_pb2.RawAudio(
+                            audio_encoding=stt_pb2.RawAudio.LINEAR16_PCM,
+                            sample_rate_hertz=self.SAMPLE_RATE,
+                            audio_channel_count=self.CHANNELS,
+                        )
+                    ),
+                    text_normalization=stt_pb2.TextNormalizationOptions(
+                        text_normalization=stt_pb2.TextNormalizationOptions.TEXT_NORMALIZATION_ENABLED,
+                        profanity_filter=self.PROFANITY_FILTER,
+                        literature_text=self.LITERATURE_TEXT,
+                    ),
+                    language_restriction=stt_pb2.LanguageRestrictionOptions(
+                        restriction_type=stt_pb2.LanguageRestrictionOptions.WHITELIST,
+                        language_code=["ru-RU"],
+                    ),
+                    audio_processing_type=stt_pb2.RecognitionModelOptions.REAL_TIME,
+                )
+            )
+
+            LOGGER.debug("Send settings")
+            yield stt_pb2.StreamingRequest(session_options=recognize_options)
+
+            LOGGER.debug("Start recording")
+            stream = audio.open(
+                format=self.FORMAT,
+                channels=self.CHANNELS,
+                rate=self.SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=self.CHUNK,
+            )
+            try:
+                frames = []
+
+                while self.killer.is_running:
+                    data = stream.read(self.CHUNK)
+                    yield stt_pb2.StreamingRequest(chunk=stt_pb2.AudioChunk(data=data))
+                    frames.append(data)
+
+                LOGGER.debug("Recognition finished")
+
+            finally:
+                stream.stop_stream()
+                stream.close()
+        finally:
+            audio.terminate()
+
+    def run(self):
+        LOGGER.debug("Establishing connection with server")
+        cred = grpc.ssl_channel_credentials()
+        channel = grpc.secure_channel("stt.api.cloud.yandex.net:443", cred)
+        stub = stt_service_pb2_grpc.RecognizerStub(channel)
+
+        LOGGER.debug("Send data for recognition")
+        it = stub.RecognizeStreaming(
+            self.generate_samples(), metadata=(("authorization", f"Api-Key {self.secret}"),)
         )
 
-        stream.start_stream()
+        LOGGER.debug("Get responses and display them")
+        try:
+            prev_type = None
+            for r in it:
+                event_type = r.WhichOneof("Event")
 
-        while stream.is_active() and self.killer.is_running:
-            await asyncio.sleep(0.1)
+                match event_type:
+                    case "partial":
+                        if len(r.partial.alternatives) == 0:
+                            continue
 
-        self.LOGGER.info("Stop reading microphone")
-        await asyncio.sleep(0.5)
-        stream.stop_stream()
-        stream.close()
+                        if prev_type in {"final", "final_refinement"}:
+                            print()
+                        alternatives = r.partial.alternatives
+                        text = " ".join(a.text for a in alternatives)
+
+                    case "final":
+                        alternatives = r.final.alternatives
+                        text = " ".join(a.text for a in alternatives)
+
+                    case "final_refinement":
+                        alternatives = r.final_refinement.normalized_text.alternatives
+                        text = " ".join(a.text for a in alternatives)
+
+                    case "status_code":
+                        continue
+                    case "eou_update":
+                        continue
+                    case None:
+                        return
+                    case _:
+                        LOGGER.warning(f"Unexpected event type {event_type}. Skip it")
+                        continue
+                print(text, end="\r")
+                prev_type = event_type
+
+        except grpc._channel._Rendezvous as err:
+            LOGGER.exception(f"Error code {err._state.code}, message: {err._state.details}")
+            raise err
 
 
 if __name__ == "__main__":
-    asyncio.run(Subtitler().start())
+    subtitler = Subtitler()
+    subtitler.run()
