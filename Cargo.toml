@@ -1,0 +1,16 @@
+[package]
+name = "subtitler"
+version = "0.1.0"
+edition = "2021"
+
+
+
+[dependencies]
+cpal = "0.15.3"
+dasp = "0.11.0"
+eframe = { version = "0.28.1", features = ["default"] }
+env_logger = { version = "0.11.3", default-features = false, features = ["auto-color", "humantime"] }
+vosk = "0.2.0"
+
+
+

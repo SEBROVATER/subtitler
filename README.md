@@ -1,2 +1,2 @@
 # subtitler
-local STT with using Vosk and displaing with egui
+local STT with using Vosk and displaying with egui
